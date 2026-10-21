@@ -337,8 +337,10 @@ jobs:
                   val d = to.filter { it.isDigit() || it == '+' }
                   if (d.length >= 6) return d
                   if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null
-                  val P = ContactsContract.CommonDataKinds.Phone
-                  contentResolver.query(P.CONTENT_URI, arrayOf(P.NUMBER), P.DISPLAY_NAME + " LIKE ?", arrayOf("%$to%"), null)?.use {
+                  val uri = ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+                  val numCol = ContactsContract.CommonDataKinds.Phone.NUMBER
+                  val nameCol = ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME
+                  contentResolver.query(uri, arrayOf(numCol), nameCol + " LIKE ?", arrayOf("%$to%"), null)?.use {
                       if (it.moveToFirst()) return it.getString(0)
                   }
                   return null
