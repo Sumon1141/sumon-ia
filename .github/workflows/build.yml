@@ -32,6 +32,8 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET"/>
               <uses-permission android:name="android.permission.RECORD_AUDIO"/>
               <uses-permission android:name="android.permission.CALL_PHONE"/>
+              <uses-permission android:name="android.permission.SEND_SMS"/>
+              <uses-permission android:name="android.permission.READ_CONTACTS"/>
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
               <queries>
                   <intent><action android:name="android.speech.RecognitionService"/></intent>
@@ -69,45 +71,87 @@ jobs:
           import android.media.AudioManager
           import android.net.Uri
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.ContactsContract
           import android.provider.Settings
           import android.speech.RecognitionListener
           import android.speech.RecognizerIntent
           import android.speech.SpeechRecognizer
           import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.telephony.SmsManager
           import android.view.Gravity
+          import android.webkit.WebView
           import android.widget.*
           import org.json.JSONArray
           import org.json.JSONObject
           import java.net.HttpURLConnection
           import java.net.URL
           import java.util.Locale
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
           import kotlin.concurrent.thread
 
           class MainActivity : Activity(), TextToSpeech.OnInitListener {
+              private val MODEL = "gemini-3.6-flash"  // এরর এলে এখানে আরেকটা Gemini মডেলের নাম দিন
+
+              private val SYSTEM = """তুমি "সুমন", ব্যবহারকারীর ফোনের ভেতরে থাকা বাংলা ভয়েস AI এজেন্ট। তুমি ব্যবহারকারীর হয়ে ফোন চালাও।
+          প্রতিবার তোমাকে দেওয়া হবে: অনুরোধ, আগের ধাপ, সর্বশেষ ফলাফল ও বর্তমান স্ক্রিনের তালিকা (প্রতিটি লাইনে [নম্বর] ধরন "লেখা" clickable/editable)।
+          তুমি প্রতিবার শুধু একটি JSON অবজেক্ট দেবে, আর কিছু না:
+          {"say":"ব্যবহারকারীকে বাংলায় ছোট একটি বাক্য (ভয়েসে পড়া হবে)","action":"...","index":0,"text":"...","to":"..."}
+          action-এর মান:
+          - answer: কথার উত্তর বা কোড দেওয়া, কাজ এখানেই শেষ। say-তে উত্তর। কোড ``` ব্লকে।
+          - done: ফোনের কাজ শেষ হয়েছে। say-তে ছোট সারাংশ।
+          - open_app: text = অ্যাপের নাম, ফোনে যেভাবে ইংরেজিতে লেখা (YouTube, WhatsApp, Files, Camera, Settings, Chrome)।
+          - open_url: text = ওয়েব ঠিকানা।
+          - click: index = স্ক্রিন তালিকার নম্বর।
+          - type: index = editable নম্বর (না থাকলে -1), text = যা লিখতে হবে।
+          - scroll_down, scroll_up, back, home, recents, notifications, wait।
+          - call: to = নাম বা নম্বর। sms: to = নাম বা নম্বর, text = মেসেজ।
+          - torch: text = on বা off। volume: text = up বা down।
+          - run_js: text = JavaScript কোড (শেষে অবশ্যই return থাকবে)। ফল পরের ধাপে "সর্বশেষ ফলাফল"-এ পাবে, তারপর answer-এ ফল জানাও।
+          নিয়ম: একবারে একটাই action। ব্যবহারকারী না চাইলেও প্রশ্ন করো না, সরাসরি কাজ করো। স্ক্রিনে যা নেই তা অনুমান করে ক্লিক করো না, দরকারে scroll করো বা back করো। কাজ হয়ে গেলে অবশ্যই done বা answer দাও। টাকা পাঠানো, কিছু ডিলিট করা বা পাসওয়ার্ড দেওয়ার মতো ঝুঁকির কাজে আগে answer দিয়ে ব্যবহারকারীর অনুমতি চাও। সবসময় বাংলায় বলো, মার্কডাউন তারকা ব্যবহার করো না।"""
+
               private lateinit var log: LinearLayout
               private lateinit var scroll: ScrollView
               private lateinit var input: EditText
               private lateinit var tts: TextToSpeech
+              private lateinit var earBtn: Button
               private var recognizer: SpeechRecognizer? = null
-              private val history = mutableListOf<Pair<String, String>>()
+              private var webView: WebView? = null
+              private val main = Handler(Looper.getMainLooper())
+              private val chat = mutableListOf<String>()
               private val prefs by lazy { getSharedPreferences("suman", MODE_PRIVATE) }
-
-              private val aliases = mapOf(
-                  "ইউটিউব" to "youtube", "ফেসবুক" to "facebook", "হোয়াটসঅ্যাপ" to "whatsapp", "ক্যামেরা" to "camera",
-                  "গ্যালারি" to "gallery", "ছবি" to "photos", "সেটিংস" to "settings", "ক্রোম" to "chrome",
-                  "মেসেঞ্জার" to "messenger", "জিমেইল" to "gmail", "ম্যাপ" to "maps", "ক্যালকুলেটর" to "calculator",
-                  "ঘড়ি" to "clock", "গুগল" to "google", "টেলিগ্রাম" to "telegram", "ইনস্টাগ্রাম" to "instagram"
-              )
+              @Volatile private var handsFree = false
+              @Volatile private var busy = false
+              @Volatile private var resumed = false
+              private var listening = false
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
                   tts = TextToSpeech(this, this)
-                  requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CALL_PHONE), 1)
+                  requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CALL_PHONE,
+                      Manifest.permission.SEND_SMS, Manifest.permission.READ_CONTACTS), 1)
+                  webView = WebView(this).also { it.settings.javaScriptEnabled = true }
                   buildUi()
-                  say("আসসালামু আলাইকুম! আমি সুমন। কী করতে পারি?")
+                  say("আসসালামু আলাইকুম! আমি সুমন। 🎧 চেপে দিলে আমি সবসময় আপনার কথা শুনব। বলুন কী করব?")
               }
 
-              override fun onInit(s: Int) { tts.language = Locale("bn", "BD") }
+              override fun onResume() { super.onResume(); resumed = true
+                  main.postDelayed({ if (handsFree && !busy && !tts.isSpeaking) listen() }, 1000) }
+              override fun onPause() { super.onPause(); resumed = false }
+
+              override fun onInit(s: Int) {
+                  tts.language = Locale("bn", "BD")
+                  tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(id: String?) {}
+                      override fun onError(id: String?) {}
+                      override fun onDone(id: String?) {
+                          main.post { if (handsFree && !busy && resumed && !tts.isSpeaking) listen() }
+                      }
+                  })
+              }
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -115,6 +159,8 @@ jobs:
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.parseColor("#0B1020")); fitsSystemWindows = true }
                   val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(14), dp(10), dp(14), dp(10)) }
                   bar.addView(TextView(this).apply { text = "সুমন"; textSize = 22f; setTextColor(Color.WHITE) }, LinearLayout.LayoutParams(0, -2, 1f))
+                  earBtn = Button(this).apply { text = "🎧"; setOnClickListener { toggleHandsFree() } }
+                  bar.addView(earBtn)
                   bar.addView(Button(this).apply { text = "🔑"; setOnClickListener { askKey() } })
                   bar.addView(Button(this).apply { text = "♿"; setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } })
                   root.addView(bar)
@@ -130,7 +176,14 @@ jobs:
                   setContentView(root)
               }
 
-              private fun addMsg(text: String, me: Boolean): TextView {
+              private fun toggleHandsFree() {
+                  handsFree = !handsFree
+                  earBtn.text = if (handsFree) "🎧✓" else "🎧"
+                  Toast.makeText(this, if (handsFree) "এখন থেকে সবসময় শুনব" else "শোনা বন্ধ", Toast.LENGTH_SHORT).show()
+                  if (handsFree && !busy) listen() else if (!handsFree) { recognizer?.cancel(); listening = false }
+              }
+
+              private fun addMsg(text: String, me: Boolean) {
                   val tv = TextView(this).apply {
                       this.text = text; textSize = 16f; setTextColor(Color.WHITE); setTextIsSelectable(true)
                       setPadding(dp(12), dp(8), dp(12), dp(8))
@@ -139,23 +192,29 @@ jobs:
                   val lp = LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, dp(4), 0, dp(4)); gravity = if (me) Gravity.END else Gravity.START }
                   log.addView(tv, lp)
                   scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
-                  return tv
               }
 
               private fun say(text: String) {
-                  addMsg(text, false)
-                  val clean = text.replace(Regex("```[\\s\\S]*?```"), " কোডটি স্ক্রিনে দেখুন। ")
-                  tts.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "suman")
+                  runOnUiThread { addMsg(text, false) }
+                  val clean = text.replace(Regex("```[\\s\\S]*?```"), " কোডটি স্ক্রিনে দেখুন। ").replace(Regex("[*#`]"), "")
+                  tts.speak(clean, TextToSpeech.QUEUE_ADD, null, "u" + System.nanoTime())
               }
 
               private fun listen() {
-                  tts.stop()
+                  if (listening) return
+                  listening = true
                   recognizer?.destroy()
                   recognizer = SpeechRecognizer.createSpeechRecognizer(this).also { r ->
                       r.setRecognitionListener(object : RecognitionListener {
-                          override fun onResults(res: Bundle?) { res?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let { handle(it) } }
-                          override fun onError(e: Int) { Toast.makeText(this@MainActivity, "বুঝতে পারিনি, আবার বলুন", Toast.LENGTH_SHORT).show() }
-                          override fun onReadyForSpeech(p: Bundle?) { Toast.makeText(this@MainActivity, "বলুন…", Toast.LENGTH_SHORT).show() }
+                          override fun onResults(res: Bundle?) {
+                              listening = false
+                              res?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let { handle(it) }
+                          }
+                          override fun onError(e: Int) {
+                              listening = false
+                              if (handsFree && !busy && resumed) main.postDelayed({ if (!tts.isSpeaking) listen() }, 1500)
+                          }
+                          override fun onReadyForSpeech(p: Bundle?) {}
                           override fun onBeginningOfSpeech() {}
                           override fun onRmsChanged(v: Float) {}
                           override fun onBufferReceived(b: ByteArray?) {}
@@ -169,73 +228,132 @@ jobs:
                   }
               }
 
-              private fun bn2en(s: String) = s.map { c -> if (c in '০'..'৯') ('0' + (c - '০')) else c }.joinToString("")
-              private fun has(s: String, vararg w: String) = w.any { s.contains(it) }
-
               private fun handle(q: String) {
-                  addMsg(q, true)
-                  val s = bn2en(q.lowercase()).trim()
-                  if (!local(s)) askAi(q)
-              }
-
-              private fun local(s: String): Boolean {
-                  val svc = SumanService.inst
-                  val num = Regex("\\+?\\d[\\d\\s-]{6,}\\d").find(s)?.value?.replace(Regex("[\\s-]"), "")
-                  when {
-                      num != null && has(s, "কল", "ফোন") -> {
-                          say("কল করছি $num")
-                          val granted = checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
-                          startActivity(Intent(if (granted) Intent.ACTION_CALL else Intent.ACTION_DIAL, Uri.parse("tel:$num")))
+                  if (busy) return
+                  addMsg(q, true); tts.stop(); busy = true
+                  thread {
+                      try { runAgent(q) } catch (e: Exception) { say("দুঃখিত, সমস্যা হয়েছে: " + (e.message ?: "")) }
+                      finally {
+                          busy = false
+                          if (!resumed) bringToFront()
+                          main.post { if (handsFree && resumed && !tts.isSpeaking) listen() }
                       }
-                      has(s, "টর্চ", "ফ্ল্যাশ") -> {
-                          val off = has(s, "বন্ধ", "নেভা", "অফ")
-                          try {
-                              val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-                              cm.setTorchMode(cm.cameraIdList[0], !off)
-                              say(if (off) "টর্চ বন্ধ করলাম" else "টর্চ জ্বালালাম")
-                          } catch (e: Exception) { say("টর্চ চালাতে পারিনি") }
-                      }
-                      has(s, "ভলিউম", "শব্দ") -> {
-                          val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-                          val up = has(s, "বাড়া", "বেশি")
-                          repeat(3) { am.adjustStreamVolume(AudioManager.STREAM_MUSIC, if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI) }
-                          say(if (up) "ভলিউম বাড়ালাম" else "ভলিউম কমালাম")
-                      }
-                      has(s, "ওয়াইফাই", "wifi", "ইন্টারনেট") -> { say("ওয়াইফাই প্যানেল খুলছি"); startActivity(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY)) }
-                      has(s, "ব্লুটুথ") -> { say("ব্লুটুথ সেটিংস খুলছি"); startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
-                      has(s, "পেছনে", "পিছনে", "ব্যাক") -> need(svc) { it.back(); say("পেছনে গেলাম") }
-                      has(s, "হোম") -> need(svc) { it.home(); say("হোমে গেলাম") }
-                      has(s, "রিসেন্ট") -> need(svc) { it.recents(); say("রিসেন্ট অ্যাপ দেখাচ্ছি") }
-                      has(s, "নোটিফিকেশন") -> need(svc) { it.notifications(); say("নোটিফিকেশন খুললাম") }
-                      has(s, "নিচে স্ক্রল", "স্ক্রল ডাউন", "নিচে নামো") -> need(svc) { say(if (it.scroll(true)) "স্ক্রল করলাম" else "স্ক্রল করার জায়গা পাইনি") }
-                      has(s, "উপরে স্ক্রল", "স্ক্রল আপ", "উপরে ওঠো") -> need(svc) { say(if (it.scroll(false)) "স্ক্রল করলাম" else "স্ক্রল করার জায়গা পাইনি") }
-                      has(s, "ক্লিক", "ট্যাপ", "চাপ দাও") -> need(svc) {
-                          val t = s.replace(Regex("(ক্লিক|ট্যাপ|চাপ দাও|করো|কর)"), "").trim()
-                          say(if (t.isNotEmpty() && it.clickText(t)) "$t চাপলাম" else "\"$t\" স্ক্রিনে পাইনি")
-                      }
-                      has(s, "খোলো", "খুলো", "ওপেন", "open", "চালু করো") -> {
-                          val name = s.replace(Regex("(খোলো|খুলো|ওপেন|open|চালু করো|করো|অ্যাপ)"), "").trim()
-                          if (!openApp(name)) say("\"$name\" নামে অ্যাপ পাইনি")
-                      }
-                      has(s, "সময়", "কয়টা বাজে") -> say("এখন সময় " + java.text.SimpleDateFormat("hh:mm a", Locale("bn", "BD")).format(java.util.Date()))
-                      else -> return false
                   }
-                  return true
               }
 
-              private fun need(svc: SumanService?, f: (SumanService) -> Unit) {
-                  if (svc == null) say("আগে ♿ বাটনে চেপে সুমনের অ্যাক্সেসিবিলিটি চালু করুন।") else f(svc)
+              private fun bringToFront() {
+                  val c: Context = SumanService.inst ?: this
+                  try { c.startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)) } catch (e: Exception) {}
+              }
+
+              private fun bn2en(s: String) = s.map { c -> if (c in '০'..'৯') ('0' + (c - '০')) else c }.joinToString("")
+
+              private fun runAgent(goal: String) {
+                  val key = prefs.getString("key", "") ?: ""
+                  if (key.isEmpty()) { say("আগে 🔑 বাটনে Gemini API Key দিন।"); return }
+                  val steps = mutableListOf<String>()
+                  var obs = ""
+                  chat.add("ব্যবহারকারী: $goal")
+                  for (i in 1..15) {
+                      val screen = SumanService.inst?.dumpScreen() ?: "(সুমনের অ্যাক্সেসিবিলিটি চালু নেই, তাই স্ক্রিন দেখা যাচ্ছে না)"
+                      val prompt = "অনুরোধ: $goal\n\nআগের কথোপকথন:\n" + chat.takeLast(8).joinToString("\n") +
+                          "\n\nএই অনুরোধে এ পর্যন্ত ধাপ:\n" + steps.takeLast(6).joinToString("\n") +
+                          "\n\nসর্বশেষ ফলাফল: $obs\n\nবর্তমান স্ক্রিন:\n$screen"
+                      val raw = gemini(key, prompt)
+                      val s0 = raw.indexOf('{'); val e0 = raw.lastIndexOf('}')
+                      if (s0 < 0 || e0 < s0) { say(raw); chat.add("সুমন: $raw"); return }
+                      val j = JSONObject(raw.substring(s0, e0 + 1))
+                      val say = j.optString("say"); val act = j.optString("action")
+                      val idx = j.optInt("index", -1); val text = j.optString("text"); val to = j.optString("to")
+                      if (say.isNotBlank()) say(say)
+                      steps.add("$i. $act index=$idx text=$text to=$to")
+                      if (act == "answer" || act == "done") { chat.add("সুমন: $say"); return }
+                      obs = doAction(act, idx, text, to)
+                      Thread.sleep(if (act == "open_app" || act == "open_url") 2500 else 1300)
+                  }
+                  say("১৫ ধাপে শেষ করতে পারিনি। আবার বলুন বা আরেকটু সহজ করে বলুন।")
+              }
+
+              private fun doAction(act: String, idx: Int, text: String, to: String): String {
+                  val svc = SumanService.inst
+                  val c: Context = svc ?: this
+                  fun needSvc(f: (SumanService) -> Boolean): String =
+                      if (svc == null) "অ্যাক্সেসিবিলিটি চালু নেই" else if (f(svc)) "ঠিক আছে" else "কাজ হয়নি"
+                  return try {
+                      when (act) {
+                          "open_app" -> if (openApp(text)) "অ্যাপ খুলেছে" else "এই নামে অ্যাপ পাওয়া যায়নি"
+                          "open_url" -> { c.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(text)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); "খুলেছে" }
+                          "click" -> needSvc { it.clickIndex(idx) }
+                          "type" -> needSvc { it.typeText(idx, text) }
+                          "scroll_down" -> needSvc { it.scroll(true) }
+                          "scroll_up" -> needSvc { it.scroll(false) }
+                          "back" -> needSvc { it.back() }
+                          "home" -> needSvc { it.home() }
+                          "recents" -> needSvc { it.recents() }
+                          "notifications" -> needSvc { it.notifications() }
+                          "wait" -> "অপেক্ষা করা হলো"
+                          "call" -> {
+                              val n = resolveNumber(to) ?: return "\"$to\" নম্বর পাওয়া যায়নি"
+                              val granted = checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+                              c.startActivity(Intent(if (granted) Intent.ACTION_CALL else Intent.ACTION_DIAL, Uri.parse("tel:$n")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                              "কল শুরু হয়েছে"
+                          }
+                          "sms" -> {
+                              val n = resolveNumber(to) ?: return "\"$to\" নম্বর পাওয়া যায়নি"
+                              if (checkSelfPermission(Manifest.permission.SEND_SMS) != PackageManager.PERMISSION_GRANTED) return "SMS পাঠানোর অনুমতি নেই"
+                              val sm = SmsManager.getDefault()
+                              sm.sendMultipartTextMessage(n, null, sm.divideMessage(text), null, null)
+                              "SMS পাঠানো হয়েছে"
+                          }
+                          "torch" -> {
+                              val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                              cm.setTorchMode(cm.cameraIdList[0], text.lowercase() == "on"); "টর্চ ঠিক আছে"
+                          }
+                          "volume" -> {
+                              val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                              repeat(3) { am.adjustStreamVolume(AudioManager.STREAM_MUSIC, if (text == "up") AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI) }
+                              "ভলিউম ঠিক আছে"
+                          }
+                          "run_js" -> runJs(text)
+                          else -> "অজানা action: $act"
+                      }
+                  } catch (e: Exception) { "ত্রুটি: " + (e.message ?: e.javaClass.simpleName) }
+              }
+
+              private fun runJs(code: String): String {
+                  val latch = CountDownLatch(1)
+                  var res = "ফল পাওয়া যায়নি"
+                  val wrapped = "(function(){try{var r=(new Function(" + JSONObject.quote(code) + "))();return String(r)}catch(e){return 'error: '+e}})()"
+                  runOnUiThread {
+                      val w = webView
+                      if (w == null) latch.countDown() else w.evaluateJavascript(wrapped) { v -> res = v ?: "null"; latch.countDown() }
+                  }
+                  latch.await(10, TimeUnit.SECONDS)
+                  return "JS ফল: $res"
+              }
+
+              private fun resolveNumber(toRaw: String): String? {
+                  val to = bn2en(toRaw).trim()
+                  val d = to.filter { it.isDigit() || it == '+' }
+                  if (d.length >= 6) return d
+                  if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null
+                  val P = ContactsContract.CommonDataKinds.Phone
+                  contentResolver.query(P.CONTENT_URI, arrayOf(P.NUMBER), P.DISPLAY_NAME + " LIKE ?", arrayOf("%$to%"), null)?.use {
+                      if (it.moveToFirst()) return it.getString(0)
+                  }
+                  return null
               }
 
               private fun openApp(name: String): Boolean {
-                  val key = (aliases[name] ?: name).lowercase()
+                  val key = name.lowercase().trim()
                   if (key.isEmpty()) return false
                   val pm = packageManager
                   val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
                   val hit = apps.firstOrNull { it.loadLabel(pm).toString().lowercase().contains(key) } ?: return false
                   val li = pm.getLaunchIntentForPackage(hit.activityInfo.packageName) ?: return false
-                  say("${hit.loadLabel(pm)} খুলছি")
-                  startActivity(li)
+                  li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  val c: Context = SumanService.inst ?: this
+                  c.startActivity(li)
                   return true
               }
 
@@ -246,38 +364,23 @@ jobs:
                       .setNegativeButton("বাতিল", null).show()
               }
 
-              private val MODEL = "gemini-3.6-flash"  // এরর এলে এখানে আরেকটা Gemini মডেলের নাম দিন
-
-              private fun askAi(q: String) {
-                  val key = prefs.getString("key", "") ?: ""
-                  if (key.isEmpty()) { say("AI উত্তরের জন্য আগে 🔑 বাটনে Gemini API Key দিন।"); return }
-                  history.add("user" to q)
-                  val wait = addMsg("ভাবছি…", false)
-                  thread {
-                      val answer = try {
-                          val contents = JSONArray()
-                          history.takeLast(10).forEach {
-                              contents.put(JSONObject().put("role", if (it.first == "user") "user" else "model")
-                                  .put("parts", JSONArray().put(JSONObject().put("text", it.second))))
-                          }
-                          val sys = "তুমি সুমন, বন্ধুসুলভ বাংলা ভয়েস সহকারী। সবসময় ছোট ও পরিষ্কার বাংলায় উত্তর দাও, মার্কডাউন তারকা বা তালিকা এড়াও। কোড চাইলে শুধু ``` ব্লকে কোড দাও।"
-                          val body = JSONObject()
-                              .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
-                              .put("contents", contents)
-                          val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent").openConnection() as HttpURLConnection
-                          c.requestMethod = "POST"; c.doOutput = true
-                          c.setRequestProperty("x-goog-api-key", key)
-                          c.setRequestProperty("content-type", "application/json")
-                          c.outputStream.use { it.write(body.toString().toByteArray()) }
-                          val ok = c.responseCode in 200..299
-                          val txt = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
-                          if (!ok) "দুঃখিত, সমস্যা হয়েছে (${c.responseCode})। API Key বা মডেলের নাম ঠিক আছে কিনা দেখুন।"
-                          else JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
-                              .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
-                      } catch (e: Exception) { "ইন্টারনেট বা সার্ভারে সমস্যা হয়েছে।" }
-                      history.add("assistant" to answer)
-                      runOnUiThread { log.removeView(wait); say(answer) }
-                  }
+              private fun gemini(key: String, prompt: String): String {
+                  val body = JSONObject()
+                      .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", SYSTEM))))
+                      .put("contents", JSONArray().put(JSONObject().put("role", "user").put("parts", JSONArray().put(JSONObject().put("text", prompt)))))
+                      .put("generationConfig", JSONObject().put("responseMimeType", "application/json"))
+                  val c = URL("https://generativelanguage.googleapis.com/v1beta/models/" + MODEL + ":generateContent").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"; c.doOutput = true; c.connectTimeout = 20000; c.readTimeout = 60000
+                  c.setRequestProperty("x-goog-api-key", key)
+                  c.setRequestProperty("content-type", "application/json")
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val ok = c.responseCode in 200..299
+                  val txt = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
+                  if (!ok) throw RuntimeException("Gemini HTTP " + c.responseCode + " (Key বা মডেলের নাম দেখুন)")
+                  val parts = JSONObject(txt).getJSONArray("candidates").getJSONObject(0).getJSONObject("content").getJSONArray("parts")
+                  val sb = StringBuilder()
+                  for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text"))
+                  return sb.toString()
               }
           }
           EOF
@@ -285,12 +388,18 @@ jobs:
           package com.suman.assistant
 
           import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
           import android.content.Intent
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Bundle
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
 
           class SumanService : AccessibilityService() {
               companion object { var inst: SumanService? = null }
+
+              private val nodes = ArrayList<AccessibilityNodeInfo>()
 
               override fun onServiceConnected() { inst = this }
               override fun onUnbind(intent: Intent?): Boolean { inst = null; return super.onUnbind(intent) }
@@ -302,14 +411,51 @@ jobs:
               fun recents() = performGlobalAction(GLOBAL_ACTION_RECENTS)
               fun notifications() = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
 
-              fun clickText(text: String): Boolean {
-                  val root = rootInActiveWindow ?: return false
-                  for (n in root.findAccessibilityNodeInfosByText(text)) {
-                      var x: AccessibilityNodeInfo? = n
-                      while (x != null && !x.isClickable) x = x.parent
-                      if (x != null) return x.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+              fun dumpScreen(): String {
+                  nodes.clear()
+                  val root = rootInActiveWindow ?: return "(স্ক্রিন পড়া যাচ্ছে না)"
+                  val sb = StringBuilder("অ্যাপ: ").append(root.packageName).append('\n')
+                  walk(root, sb)
+                  return sb.toString().take(7000)
+              }
+
+              private fun walk(n: AccessibilityNodeInfo?, sb: StringBuilder) {
+                  if (n == null || nodes.size >= 120) return
+                  val t = (n.text ?: n.contentDescription ?: "").toString().replace("\n", " ").take(60)
+                  if (n.isVisibleToUser && (t.isNotEmpty() || n.isClickable || n.isEditable)) {
+                      sb.append('[').append(nodes.size).append("] ")
+                          .append(n.className?.toString()?.substringAfterLast('.') ?: "")
+                          .append(" \"").append(t).append('"')
+                      if (n.isClickable) sb.append(" clickable")
+                      if (n.isEditable) sb.append(" editable")
+                      if (n.isScrollable) sb.append(" scrollable")
+                      sb.append('\n')
+                      nodes.add(n)
                   }
-                  return false
+                  for (i in 0 until n.childCount) walk(n.getChild(i), sb)
+              }
+
+              fun clickIndex(i: Int): Boolean {
+                  val n = nodes.getOrNull(i) ?: return false
+                  var x: AccessibilityNodeInfo? = n
+                  while (x != null && !x.isClickable) x = x.parent
+                  if (x != null && x.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                  val r = Rect(); n.getBoundsInScreen(r)
+                  return tapAt(r.centerX().toFloat(), r.centerY().toFloat())
+              }
+
+              fun tapAt(x: Float, y: Float): Boolean {
+                  val p = Path().apply { moveTo(x, y) }
+                  val g = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0, 80)).build()
+                  return dispatchGesture(g, null, null)
+              }
+
+              fun typeText(i: Int, text: String): Boolean {
+                  val n = nodes.getOrNull(i)?.takeIf { it.isEditable }
+                      ?: rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                      ?: return false
+                  val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) }
+                  return n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
               }
 
               fun scroll(forward: Boolean): Boolean {
@@ -359,6 +505,7 @@ jobs:
               android:accessibilityEventTypes="typeWindowStateChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
               android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
               android:description="@string/a11y_desc"
               android:notificationTimeout="100"/>
           EOF
