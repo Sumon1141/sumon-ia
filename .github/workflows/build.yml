@@ -1,0 +1,383 @@
+name: Build Suman APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p Suman/app Suman/app/src/main Suman/app/src/main/java/com/suman/assistant Suman/app/src/main/res/drawable Suman/app/src/main/res/mipmap-anydpi-v26 Suman/app/src/main/res/values Suman/app/src/main/res/xml
+          cat > Suman/app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.suman.assistant"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.suman.assistant"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > Suman/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.CALL_PHONE"/>
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>
+              <queries>
+                  <intent><action android:name="android.speech.RecognitionService"/></intent>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>
+              </queries>
+              <application android:label="@string/app_name" android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".SumanService" android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > Suman/app/src/main/java/com/suman/assistant/MainActivity.kt <<'EOF'
+          package com.suman.assistant
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.view.Gravity
+          import android.widget.*
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.Locale
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity(), TextToSpeech.OnInitListener {
+              private lateinit var log: LinearLayout
+              private lateinit var scroll: ScrollView
+              private lateinit var input: EditText
+              private lateinit var tts: TextToSpeech
+              private var recognizer: SpeechRecognizer? = null
+              private val history = mutableListOf<Pair<String, String>>()
+              private val prefs by lazy { getSharedPreferences("suman", MODE_PRIVATE) }
+
+              private val aliases = mapOf(
+                  "ইউটিউব" to "youtube", "ফেসবুক" to "facebook", "হোয়াটসঅ্যাপ" to "whatsapp", "ক্যামেরা" to "camera",
+                  "গ্যালারি" to "gallery", "ছবি" to "photos", "সেটিংস" to "settings", "ক্রোম" to "chrome",
+                  "মেসেঞ্জার" to "messenger", "জিমেইল" to "gmail", "ম্যাপ" to "maps", "ক্যালকুলেটর" to "calculator",
+                  "ঘড়ি" to "clock", "গুগল" to "google", "টেলিগ্রাম" to "telegram", "ইনস্টাগ্রাম" to "instagram"
+              )
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  tts = TextToSpeech(this, this)
+                  requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CALL_PHONE), 1)
+                  buildUi()
+                  say("আসসালামু আলাইকুম! আমি সুমন। কী করতে পারি?")
+              }
+
+              override fun onInit(s: Int) { tts.language = Locale("bn", "BD") }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.parseColor("#0B1020")); fitsSystemWindows = true }
+                  val bar = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(14), dp(10), dp(14), dp(10)) }
+                  bar.addView(TextView(this).apply { text = "সুমন"; textSize = 22f; setTextColor(Color.WHITE) }, LinearLayout.LayoutParams(0, -2, 1f))
+                  bar.addView(Button(this).apply { text = "🔑"; setOnClickListener { askKey() } })
+                  bar.addView(Button(this).apply { text = "♿"; setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } })
+                  root.addView(bar)
+                  log = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(6), dp(12), dp(6)) }
+                  scroll = ScrollView(this).apply { addView(log) }
+                  root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+                  val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(10), dp(8), dp(10), dp(8)) }
+                  input = EditText(this).apply { hint = "লিখুন…"; setTextColor(Color.WHITE); setHintTextColor(Color.GRAY) }
+                  row.addView(input, LinearLayout.LayoutParams(0, -2, 1f))
+                  row.addView(Button(this).apply { text = "➤"; setOnClickListener { val q = input.text.toString().trim(); input.setText(""); if (q.isNotEmpty()) handle(q) } })
+                  row.addView(Button(this).apply { text = "🎤"; setOnClickListener { listen() } })
+                  root.addView(row)
+                  setContentView(root)
+              }
+
+              private fun addMsg(text: String, me: Boolean): TextView {
+                  val tv = TextView(this).apply {
+                      this.text = text; textSize = 16f; setTextColor(Color.WHITE); setTextIsSelectable(true)
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                      background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.parseColor(if (me) "#2B3A8F" else "#151B33")) }
+                  }
+                  val lp = LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, dp(4), 0, dp(4)); gravity = if (me) Gravity.END else Gravity.START }
+                  log.addView(tv, lp)
+                  scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+                  return tv
+              }
+
+              private fun say(text: String) {
+                  addMsg(text, false)
+                  val clean = text.replace(Regex("```[\\s\\S]*?```"), " কোডটি স্ক্রিনে দেখুন। ")
+                  tts.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "suman")
+              }
+
+              private fun listen() {
+                  tts.stop()
+                  recognizer?.destroy()
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this).also { r ->
+                      r.setRecognitionListener(object : RecognitionListener {
+                          override fun onResults(res: Bundle?) { res?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let { handle(it) } }
+                          override fun onError(e: Int) { Toast.makeText(this@MainActivity, "বুঝতে পারিনি, আবার বলুন", Toast.LENGTH_SHORT).show() }
+                          override fun onReadyForSpeech(p: Bundle?) { Toast.makeText(this@MainActivity, "বলুন…", Toast.LENGTH_SHORT).show() }
+                          override fun onBeginningOfSpeech() {}
+                          override fun onRmsChanged(v: Float) {}
+                          override fun onBufferReceived(b: ByteArray?) {}
+                          override fun onEndOfSpeech() {}
+                          override fun onPartialResults(p: Bundle?) {}
+                          override fun onEvent(t: Int, p: Bundle?) {}
+                      })
+                      r.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD"))
+                  }
+              }
+
+              private fun bn2en(s: String) = s.map { c -> if (c in '০'..'৯') ('0' + (c - '০')) else c }.joinToString("")
+              private fun has(s: String, vararg w: String) = w.any { s.contains(it) }
+
+              private fun handle(q: String) {
+                  addMsg(q, true)
+                  val s = bn2en(q.lowercase()).trim()
+                  if (!local(s)) askAi(q)
+              }
+
+              private fun local(s: String): Boolean {
+                  val svc = SumanService.inst
+                  val num = Regex("\\+?\\d[\\d\\s-]{6,}\\d").find(s)?.value?.replace(Regex("[\\s-]"), "")
+                  when {
+                      num != null && has(s, "কল", "ফোন") -> {
+                          say("কল করছি $num")
+                          val granted = checkSelfPermission(Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
+                          startActivity(Intent(if (granted) Intent.ACTION_CALL else Intent.ACTION_DIAL, Uri.parse("tel:$num")))
+                      }
+                      has(s, "টর্চ", "ফ্ল্যাশ") -> {
+                          val off = has(s, "বন্ধ", "নেভা", "অফ")
+                          try {
+                              val cm = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                              cm.setTorchMode(cm.cameraIdList[0], !off)
+                              say(if (off) "টর্চ বন্ধ করলাম" else "টর্চ জ্বালালাম")
+                          } catch (e: Exception) { say("টর্চ চালাতে পারিনি") }
+                      }
+                      has(s, "ভলিউম", "শব্দ") -> {
+                          val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                          val up = has(s, "বাড়া", "বেশি")
+                          repeat(3) { am.adjustStreamVolume(AudioManager.STREAM_MUSIC, if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI) }
+                          say(if (up) "ভলিউম বাড়ালাম" else "ভলিউম কমালাম")
+                      }
+                      has(s, "ওয়াইফাই", "wifi", "ইন্টারনেট") -> { say("ওয়াইফাই প্যানেল খুলছি"); startActivity(Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY)) }
+                      has(s, "ব্লুটুথ") -> { say("ব্লুটুথ সেটিংস খুলছি"); startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
+                      has(s, "পেছনে", "পিছনে", "ব্যাক") -> need(svc) { it.back(); say("পেছনে গেলাম") }
+                      has(s, "হোম") -> need(svc) { it.home(); say("হোমে গেলাম") }
+                      has(s, "রিসেন্ট") -> need(svc) { it.recents(); say("রিসেন্ট অ্যাপ দেখাচ্ছি") }
+                      has(s, "নোটিফিকেশন") -> need(svc) { it.notifications(); say("নোটিফিকেশন খুললাম") }
+                      has(s, "নিচে স্ক্রল", "স্ক্রল ডাউন", "নিচে নামো") -> need(svc) { say(if (it.scroll(true)) "স্ক্রল করলাম" else "স্ক্রল করার জায়গা পাইনি") }
+                      has(s, "উপরে স্ক্রল", "স্ক্রল আপ", "উপরে ওঠো") -> need(svc) { say(if (it.scroll(false)) "স্ক্রল করলাম" else "স্ক্রল করার জায়গা পাইনি") }
+                      has(s, "ক্লিক", "ট্যাপ", "চাপ দাও") -> need(svc) {
+                          val t = s.replace(Regex("(ক্লিক|ট্যাপ|চাপ দাও|করো|কর)"), "").trim()
+                          say(if (t.isNotEmpty() && it.clickText(t)) "$t চাপলাম" else "\"$t\" স্ক্রিনে পাইনি")
+                      }
+                      has(s, "খোলো", "খুলো", "ওপেন", "open", "চালু করো") -> {
+                          val name = s.replace(Regex("(খোলো|খুলো|ওপেন|open|চালু করো|করো|অ্যাপ)"), "").trim()
+                          if (!openApp(name)) say("\"$name\" নামে অ্যাপ পাইনি")
+                      }
+                      has(s, "সময়", "কয়টা বাজে") -> say("এখন সময় " + java.text.SimpleDateFormat("hh:mm a", Locale("bn", "BD")).format(java.util.Date()))
+                      else -> return false
+                  }
+                  return true
+              }
+
+              private fun need(svc: SumanService?, f: (SumanService) -> Unit) {
+                  if (svc == null) say("আগে ♿ বাটনে চেপে সুমনের অ্যাক্সেসিবিলিটি চালু করুন।") else f(svc)
+              }
+
+              private fun openApp(name: String): Boolean {
+                  val key = (aliases[name] ?: name).lowercase()
+                  if (key.isEmpty()) return false
+                  val pm = packageManager
+                  val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                  val hit = apps.firstOrNull { it.loadLabel(pm).toString().lowercase().contains(key) } ?: return false
+                  val li = pm.getLaunchIntentForPackage(hit.activityInfo.packageName) ?: return false
+                  say("${hit.loadLabel(pm)} খুলছি")
+                  startActivity(li)
+                  return true
+              }
+
+              private fun askKey() {
+                  val et = EditText(this).apply { hint = "AIza..."; setText(prefs.getString("key", "")) }
+                  AlertDialog.Builder(this).setTitle("Gemini API Key").setView(et)
+                      .setPositiveButton("সেভ") { _, _ -> prefs.edit().putString("key", et.text.toString().trim()).apply() }
+                      .setNegativeButton("বাতিল", null).show()
+              }
+
+              private val MODEL = "gemini-3.6-flash"  // এরর এলে এখানে আরেকটা Gemini মডেলের নাম দিন
+
+              private fun askAi(q: String) {
+                  val key = prefs.getString("key", "") ?: ""
+                  if (key.isEmpty()) { say("AI উত্তরের জন্য আগে 🔑 বাটনে Gemini API Key দিন।"); return }
+                  history.add("user" to q)
+                  val wait = addMsg("ভাবছি…", false)
+                  thread {
+                      val answer = try {
+                          val contents = JSONArray()
+                          history.takeLast(10).forEach {
+                              contents.put(JSONObject().put("role", if (it.first == "user") "user" else "model")
+                                  .put("parts", JSONArray().put(JSONObject().put("text", it.second))))
+                          }
+                          val sys = "তুমি সুমন, বন্ধুসুলভ বাংলা ভয়েস সহকারী। সবসময় ছোট ও পরিষ্কার বাংলায় উত্তর দাও, মার্কডাউন তারকা বা তালিকা এড়াও। কোড চাইলে শুধু ``` ব্লকে কোড দাও।"
+                          val body = JSONObject()
+                              .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", sys))))
+                              .put("contents", contents)
+                          val c = URL("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent").openConnection() as HttpURLConnection
+                          c.requestMethod = "POST"; c.doOutput = true
+                          c.setRequestProperty("x-goog-api-key", key)
+                          c.setRequestProperty("content-type", "application/json")
+                          c.outputStream.use { it.write(body.toString().toByteArray()) }
+                          val ok = c.responseCode in 200..299
+                          val txt = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
+                          if (!ok) "দুঃখিত, সমস্যা হয়েছে (${c.responseCode})। API Key বা মডেলের নাম ঠিক আছে কিনা দেখুন।"
+                          else JSONObject(txt).getJSONArray("candidates").getJSONObject(0)
+                              .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                      } catch (e: Exception) { "ইন্টারনেট বা সার্ভারে সমস্যা হয়েছে।" }
+                      history.add("assistant" to answer)
+                      runOnUiThread { log.removeView(wait); say(answer) }
+                  }
+              }
+          }
+          EOF
+          cat > Suman/app/src/main/java/com/suman/assistant/SumanService.kt <<'EOF'
+          package com.suman.assistant
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class SumanService : AccessibilityService() {
+              companion object { var inst: SumanService? = null }
+
+              override fun onServiceConnected() { inst = this }
+              override fun onUnbind(intent: Intent?): Boolean { inst = null; return super.onUnbind(intent) }
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              fun back() = performGlobalAction(GLOBAL_ACTION_BACK)
+              fun home() = performGlobalAction(GLOBAL_ACTION_HOME)
+              fun recents() = performGlobalAction(GLOBAL_ACTION_RECENTS)
+              fun notifications() = performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+
+              fun clickText(text: String): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  for (n in root.findAccessibilityNodeInfosByText(text)) {
+                      var x: AccessibilityNodeInfo? = n
+                      while (x != null && !x.isClickable) x = x.parent
+                      if (x != null) return x.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                  }
+                  return false
+              }
+
+              fun scroll(forward: Boolean): Boolean {
+                  val node = findScrollable(rootInActiveWindow) ?: return false
+                  return node.performAction(
+                      if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
+              }
+
+              private fun findScrollable(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+                  if (n == null) return null
+                  if (n.isScrollable) return n
+                  for (i in 0 until n.childCount) findScrollable(n.getChild(i))?.let { return it }
+                  return null
+              }
+          }
+          EOF
+          cat > Suman/app/src/main/res/drawable/ic_bg.xml <<'EOF'
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <gradient android:startColor="#6A5CFF" android:endColor="#19C6FF" android:angle="315"/>
+          </shape>
+          EOF
+          cat > Suman/app/src/main/res/drawable/ic_fg.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#FFFFFF" android:pathData="M54,54m-24,0a24,24 0,1 1,48 0a24,24 0,1 1,-48 0"/>
+              <path android:fillColor="#4A46E8" android:pathData="M49,40h10a5,5 0,0 1,5 5v10a5,5 0,0 1,-5 5h-10a5,5 0,0 1,-5 -5v-10a5,5 0,0 1,5 -5z"/>
+              <path android:strokeColor="#4A46E8" android:strokeWidth="3" android:strokeLineCap="round" android:pathData="M41,54a13,13 0,0 0,26 0M54,67v6"/>
+              <path android:strokeColor="#CCFFFFFF" android:strokeWidth="3.5" android:strokeLineCap="round" android:pathData="M22,44q-5,10 0,20M86,44q5,10 0,20"/>
+              <path android:strokeColor="#99FFFFFF" android:strokeWidth="3.5" android:strokeLineCap="round" android:pathData="M12,40q-8,14 0,28M96,40q8,14 0,28"/>
+          </vector>
+          EOF
+          cat > Suman/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_bg"/>
+              <foreground android:drawable="@drawable/ic_fg"/>
+          </adaptive-icon>
+          EOF
+          cat > Suman/app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">সুমন</string>
+              <string name="a11y_desc">সুমনকে ফোনের স্ক্রিনে ক্লিক, স্ক্রল, ব্যাক ও হোম করার অনুমতি দেয়।</string>
+          </resources>
+          EOF
+          cat > Suman/app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/a11y_desc"
+              android:notificationTimeout="100"/>
+          EOF
+          cat > Suman/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > Suman/settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Suman"
+          include(":app")
+          EOF
+      - name: Build APK
+        working-directory: Suman
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: suman-apk
+          path: Suman/app/build/outputs/apk/debug/app-debug.apk
